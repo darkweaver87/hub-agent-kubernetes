@@ -49,6 +49,34 @@ linters-settings:
   gomoddirectives:
     replace-allow-list:
       - github.com/abbot/go-http-auth
+      - github.com/banzaicloud/kurun/tunnel
+      - k8s.io/api
+      - k8s.io/apiextensions-apiserver
+      - k8s.io/apimachinery
+      - k8s.io/apiserver
+      - k8s.io/client-go
+      - k8s.io/cloud-provider
+      - k8s.io/cluster-bootstrap
+      - k8s.io/code-generator
+      - k8s.io/component-base
+      - k8s.io/component-helpers
+      - k8s.io/controller-manager
+      - k8s.io/cri-api
+      - k8s.io/csi-translation-lib
+      - k8s.io/dynamic-resource-allocation
+      - k8s.io/kube-aggregator
+      - k8s.io/kube-controller-manager
+      - k8s.io/kubectl
+      - k8s.io/kubelet
+      - k8s.io/kube-proxy
+      - k8s.io/kube-scheduler
+      - k8s.io/legacy-cloud-providers
+      - k8s.io/mount-utils
+      - k8s.io/pod-security-admission
+      - k8s.io/sample-apiserver
+      - k8s.io/sample-cli-plugin
+      - k8s.io/sample-controller
+      - kube-aggregator
   goheader:
     values:
       const:
@@ -266,3 +294,9 @@ issues:
     - path: pkg/api/watcher_gateway_test.go
       linters:
         - gocognit
+
+    # Integration
+    - path: integration/tunnel_test.go
+      text: "G402: TLS InsecureSkipVerify set true."
+    - path: integration/main_test.go
+      text: "found a struct that contains a context.Context field"
