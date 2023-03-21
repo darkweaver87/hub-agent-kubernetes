@@ -14,7 +14,7 @@ DOCKER_BUILD_PLATFORMS ?= linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6
 DOCKER_IMAGE_TAG ?= $(if $(TAG_NAME),$(TAG_NAME),latest)
 OUTPUT := $(if $(OUTPUT),$(OUTPUT),$(BIN_NAME))
 
-default: clean build-portal lint test build
+default: clean build-portal lint test build integration
 
 lint:
 	golangci-lint run
@@ -23,7 +23,7 @@ clean:
 	rm -rf cover.out
 
 test: clean
-	go test -v -race -cover ./...
+	go test -v -race -cover $(shell go list ./... | grep -vE '/integration$$')
 
 build: clean
 	@echo Version: $(VERSION) $(BUILD_DATE)
@@ -65,4 +65,4 @@ generate-crd:
 
 ## Integration tests
 integration: image
-	cd integration && HUB_IMAGE="ghcr.io/traefik/$(BIN_NAME):$(VERSION)" go test -v
+	cd integration && HUB_IMAGE="ghcr.io/traefik/$(BIN_NAME):$(VERSION)" go test -v -race

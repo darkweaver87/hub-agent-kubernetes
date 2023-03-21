@@ -18,17 +18,22 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 package integration
 
 import (
-	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/suite"
 	hubv1alpha1 "github.com/traefik/hub-agent-kubernetes/pkg/crd/api/hub/v1alpha1"
 	hubclientset "github.com/traefik/hub-agent-kubernetes/pkg/crd/generated/client/hub/clientset/versioned"
@@ -36,6 +41,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	testutils "k8s.io/kubernetes/test/utils"
 	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
 	"sigs.k8s.io/e2e-framework/third_party/helm"
@@ -50,6 +56,7 @@ const (
 type AgentSuite struct {
 	K8SSuite
 	hub              *httptest.Server
+	hubMock          *hubHandler
 	agentNamespace   string
 	traefikNamespace string
 }
@@ -71,11 +78,46 @@ func TestAgentSuite(t *testing.T) {
 	})
 }
 
+// getLocalIP returns the non loopback local IP of the host.
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, address := range addrs {
+		// check the address type and if it is not a loopback the display it
+		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+	return ""
+}
+
 func (s *AgentSuite) SetupSuite() {
 	s.K8SSuite.SetupSuite()
 
 	var err error
-	s.hub = httptest.NewServer(getHubRouter())
+	l, err := net.Listen("tcp", fmt.Sprintf("%s:", getLocalIP()))
+	if err != nil {
+		s.T().Fatalf("can't create listener: %s", err)
+	}
+
+	var router chi.Router
+	router, s.hubMock = getHubRouter(s.T(), l)
+	s.hub = httptest.NewUnstartedServer(router)
+	err = s.hub.Listener.Close()
+	if err != nil {
+		s.T().Fatalf("can't close listener: %s", err)
+	}
+	s.hub.Listener = l
+	s.hub.Start()
+
+	err = s.hubMock.createCA()
+	if err != nil {
+		s.T().Fatalf("can't create CA: %s", err)
+	}
 
 	s.ctx, err = envfuncs.CreateNamespace(s.agentNamespace)(s.ctx, s.testConf)
 	if err != nil {
@@ -85,11 +127,6 @@ func (s *AgentSuite) SetupSuite() {
 	s.ctx, err = envfuncs.CreateNamespace(s.traefikNamespace)(s.ctx, s.testConf)
 	if err != nil {
 		s.T().Fatalf("can't create namespace: %s", err)
-	}
-
-	err = s.setupForward(context.Background())
-	if err != nil {
-		s.T().Fatalf("can't setupForward: %s", err)
 	}
 
 	hubImage := os.Getenv(hubImageEnvVar)
@@ -113,6 +150,9 @@ func (s *AgentSuite) SetupSuite() {
 }
 
 func (s *AgentSuite) TearDownSuite() {
+	if s.hubMock.brokerListener != nil {
+		_ = s.hubMock.brokerListener.Close()
+	}
 	s.K8SSuite.TearDownSuite()
 }
 
@@ -140,7 +180,7 @@ func (s *AgentSuite) installTraefik() error {
 }
 
 func (s *AgentSuite) installHubAgent(image string) error {
-	platformURL := fmt.Sprintf("http://%s.%s.svc:%d", kurunServiceName, kurunNamespace, kurunServicePort)
+	platformURL := s.hub.URL
 
 	manager := helm.New(s.testConf.KubeconfigFile())
 	err := manager.RunRepo(helm.WithArgs("add", "traefik", "https://traefik.github.io/charts"))
@@ -157,6 +197,7 @@ func (s *AgentSuite) installHubAgent(image string) error {
 		"--set", "token=XXX",
 		"--set", "controllerDeployment.traefik.metricsURL=http://traefik-hub.traefik.svc.cluster.local:9100/metrics",
 		"--set", "controllerDeployment.traefik.metricsURL=http://traefik-hub.traefik.svc.cluster.local:9100/metrics",
+		"--set", "tunnelDeployment.traefik.tunnelHost=traefik-hub.traefik.svc.cluster.local",
 		"--set-json", fmt.Sprintf(`'controllerDeployment.args=["--platform-url=%s"]'`, platformURL),
 		"--set-json", fmt.Sprintf(`'tunnelDeployment.args=["--platform-url=%s"]'`, platformURL),
 	}
@@ -242,14 +283,66 @@ func (s *AgentSuite) TestEdgeIngress() {
 	hubClient, err := hubclientset.NewForConfig(cfg)
 	s.Nil(err)
 
+	_, err = client.CoreV1().Pods("default").Create(s.ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "whoami",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/name": "whoami",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "whoami",
+					Image: "ghcr.io/traefik/whoami:v1.9.0",
+					Args: []string{
+						"-port",
+						"8080",
+					},
+					Ports: []corev1.ContainerPort{
+						{
+							ContainerPort: 8080,
+						},
+					},
+				},
+			},
+			RestartPolicy: corev1.RestartPolicyNever,
+		},
+	}, metav1.CreateOptions{})
+	s.Nil(err)
+
+	_, err = client.CoreV1().Services("default").Create(s.ctx, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "whoami",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app.kubernetes.io/name": "whoami",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeClusterIP,
+			Selector: map[string]string{
+				"app.kubernetes.io/name": "whoami",
+			},
+			Ports: []corev1.ServicePort{
+				{
+					Port:       8080,
+					TargetPort: intstr.FromInt(8080),
+				},
+			},
+		},
+	}, metav1.CreateOptions{})
+	s.Nil(err)
+
 	_, err = hubClient.HubV1alpha1().EdgeIngresses("default").Create(s.ctx, &hubv1alpha1.EdgeIngress{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-ingress",
+			Name:      "whoami",
 			Namespace: "default",
 		},
 		Spec: hubv1alpha1.EdgeIngressSpec{
 			Service: hubv1alpha1.EdgeIngressService{
-				Name: "hub-forward",
+				Name: "whoami",
 				Port: 8080,
 			},
 		},
@@ -272,64 +365,42 @@ func (s *AgentSuite) TestEdgeIngress() {
 		},
 	})
 
-	traefikSvc, err := client.CoreV1().Services(s.traefikNamespace).Get(s.ctx, "traefik-hub", metav1.GetOptions{})
-	s.Nil(err)
+	time.Sleep(1 * time.Second)
 
-	pod, err := client.CoreV1().Pods("default").Create(s.ctx, &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-ingress",
-			Namespace: "default",
-			Labels: map[string]string{
-				"test-ingress": "test-ingress",
-			},
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:  "test-ingress",
-					Image: "curlimages/curl",
-					Args: []string{
-						"https://test.localhost:9901/test-ingress",
-						"-k",
-						"--resolv",
-						"test.localhost:9901:" + traefikSvc.Spec.ClusterIP,
-					},
-					TTY: false,
-				},
-			},
-			RestartPolicy: corev1.RestartPolicyNever,
-		},
-	}, metav1.CreateOptions{})
-	s.Nil(err)
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(s.hubMock.caCertPEM)
+	tlsConfig := &tls.Config{
+		RootCAs:    caCertPool,
+		MinVersion: tls.VersionTLS12,
+	}
+	transport := &http.Transport{TLSClientConfig: tlsConfig, DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr == "test.localhost:443" {
+			addr = s.hubMock.tunnelAddr
+		}
 
-	watcher, err = client.CoreV1().Pods(pod.Namespace).Watch(s.ctx, metav1.ListOptions{
-		Watch: true,
-	})
-	s.Nil(err)
+		dialer := &net.Dialer{Timeout: 2 * time.Second}
+		return dialer.DialContext(ctx, network, addr)
+	}}
+	httpClient := &http.Client{Transport: transport}
 
-	obj := s.waitForCondition(watcher, 60*time.Second, waitCondition{
-		desc: "pod to run",
-		fn: func(obj runtime.Object) bool {
-			item := obj.(*corev1.Pod)
-			if item != nil && (item.Status.Phase == corev1.PodFailed || item.Status.Phase == corev1.PodSucceeded) {
-				return true
-			}
-			return false
-		},
-	})
-	pod = obj.(*corev1.Pod)
-	s.Equal(corev1.PodSucceeded, pod.Status.Phase)
+	resp, err := httpClient.Get("https://test.localhost/api")
+	if err != nil {
+		s.T().Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
-	req := client.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{})
-	podLogs, err := req.Stream(s.ctx)
-	s.Nil(err)
-	defer func() { _ = podLogs.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		s.T().Fatal(err)
+	}
 
-	buf := new(bytes.Buffer)
-	_, err = io.Copy(buf, podLogs)
-	s.Nil(err)
-	str := buf.String()
+	whoamiAPI := struct {
+		Hostname string `json:"hostname"`
+	}{}
 
-	lines := strings.Split(str, "\n")
-	s.Equal(lines[len(lines)-1], "It works !")
+	if err = json.Unmarshal(body, &whoamiAPI); err != nil {
+		s.T().Fatal(err)
+	}
+
+	s.Equal("whoami", whoamiAPI.Hostname)
 }

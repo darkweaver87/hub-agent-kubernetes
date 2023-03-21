@@ -296,7 +296,7 @@ issues:
         - gocognit
 
     # Integration
-    - path: integration/tunnel_test.go
-      text: "G402: TLS InsecureSkipVerify set true."
+    - path: integration/hub_test.go
+      text: "netErr.Temporary has been deprecated since Go 1.18 because it shouldn't be used: Temporary errors are not well-defined. Most \"temporary\" errors are timeouts, and the few exceptions are surprising. Do not use this method."
     - path: integration/main_test.go
       text: "found a struct that contains a context.Context field"

@@ -4,7 +4,6 @@ go 1.20
 
 require (
 	github.com/abbot/go-http-auth v0.4.0
-	github.com/banzaicloud/kurun/tunnel v0.0.0
 	github.com/coreos/go-oidc/v3 v3.2.0
 	github.com/ettle/strcase v0.1.1
 	github.com/evanphx/json-patch v5.6.0+incompatible
@@ -36,12 +35,10 @@ require (
 	k8s.io/klog/v2 v2.80.1
 	k8s.io/kubernetes v1.26.2
 	k8s.io/utils v0.0.0-20221128185143-99ec85e7a448
-	sigs.k8s.io/controller-runtime v0.14.1
 	sigs.k8s.io/e2e-framework v0.1.0
 )
 
 require (
-	emperror.dev/errors v0.8.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/blang/semver/v4 v4.0.0 // indirect
 	github.com/cenkalti/backoff/v4 v4.1.3 // indirect
@@ -103,8 +100,6 @@ require (
 	go.opentelemetry.io/otel/sdk v1.10.0 // indirect
 	go.opentelemetry.io/otel/trace v1.10.0 // indirect
 	go.opentelemetry.io/proto/otlp v0.19.0 // indirect
-	go.uber.org/atomic v1.7.0 // indirect
-	go.uber.org/multierr v1.6.0 // indirect
 	golang.org/x/net v0.7.0 // indirect
 	golang.org/x/sys v0.5.0 // indirect
 	golang.org/x/term v0.5.0 // indirect
@@ -124,6 +119,7 @@ require (
 	k8s.io/kube-openapi v0.0.0-20221012153701-172d655c2280 // indirect
 	k8s.io/kubectl v0.0.0 // indirect
 	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.0.35 // indirect
+	sigs.k8s.io/controller-runtime v0.14.1 // indirect
 	sigs.k8s.io/json v0.0.0-20220713155537-f223a00ba0e2 // indirect
 	sigs.k8s.io/structured-merge-diff/v4 v4.2.3 // indirect
 	sigs.k8s.io/yaml v1.3.0 // indirect
@@ -131,7 +127,6 @@ require (
 
 replace (
 	github.com/abbot/go-http-auth => github.com/containous/go-http-auth v0.4.1-0.20210329152427-e70ce7ef1ade
-	github.com/banzaicloud/kurun/tunnel => github.com/banzaicloud/kurun/tunnel v0.0.0-20230306142015-6cd75980f9d2
 	k8s.io/api => k8s.io/api v0.26.0
 	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.26.0
 	k8s.io/apimachinery => k8s.io/apimachinery v0.26.1-rc.0

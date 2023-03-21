@@ -25,16 +25,22 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/gorilla/websocket"
 	"github.com/hamba/avro"
+	"github.com/hashicorp/yamux"
 	"github.com/traefik/hub-agent-kubernetes/pkg/alerting"
 	"github.com/traefik/hub-agent-kubernetes/pkg/edgeingress"
 	"github.com/traefik/hub-agent-kubernetes/pkg/metrics"
@@ -44,12 +50,23 @@ import (
 	"github.com/traefik/hub-agent-kubernetes/pkg/tunnel"
 )
 
+const (
+	tunnelAcceptBacklog = 256
+	minStreamWindowSize = uint32(256 * 1024)
+)
+
 type hubHandler struct {
+	t               *testing.T
 	clusterID       string
 	workspaceID     string
 	topologyVersion int64
 	topology        []byte
 	edgeingresses   []edgeingress.EdgeIngress
+	brokerListener  net.Listener
+	tunnelAddr      string
+	caCert          *x509.Certificate
+	caPrivKey       *rsa.PrivateKey
+	caCertPEM       []byte
 }
 
 func (h *hubHandler) Routes() http.Handler {
@@ -71,18 +88,58 @@ func (h *hubHandler) Routes() http.Handler {
 	router.Delete(resourcePatterns+"/{id}", h.handleDeleteResource)
 
 	router.Get("/data", h.handleGetPreviousData)
+	router.Post("/metrics", h.handleSendMetrics)
 
 	router.Get("/rules", h.handleGetRules)
 	router.Post("/preflight", h.handlePreflightAlerts)
 
 	router.Get("/tunnel-endpoints", h.handleListClusterTunnelEndpoints)
 
-	router.Get("/test-ingress", h.handleTestIngress)
+	router.Get("/fake-tunnel-id", h.handleCreateBrokerTunnel)
 	return router
 }
 
+func (h *hubHandler) httpError(rw http.ResponseWriter, err error) {
+	rw.WriteHeader(http.StatusInternalServerError)
+	_, _ = rw.Write([]byte(err.Error()))
+}
+
+func (h *hubHandler) createCA() error {
+	ca := &x509.Certificate{
+		SerialNumber: big.NewInt(2023),
+		Subject: pkix.Name{
+			Organization: []string{"TraefikLabs"},
+			Country:      []string{"FR"},
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+
+	caPrivKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		return err
+	}
+
+	caBytes, err := x509.CreateCertificate(rand.Reader, ca, ca, &caPrivKey.PublicKey, caPrivKey)
+	if err != nil {
+		return err
+	}
+
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caBytes})
+
+	h.caCert = ca
+	h.caCertPEM = caPEM
+	h.caPrivKey = caPrivKey
+
+	return nil
+}
+
 func (h *hubHandler) handleLink(rw http.ResponseWriter, req *http.Request) {
-	_, _ = rw.Write([]byte(`{"clusterID":"1"}`))
+	fmt.Fprintf(rw, `{"clusterID":"%s"}`, h.clusterID)
 }
 
 func (h *hubHandler) handlePing(rw http.ResponseWriter, req *http.Request) {
@@ -99,17 +156,16 @@ func (h *hubHandler) handleConfig(rw http.ResponseWriter, req *http.Request) {
 }
 
 func (h *hubHandler) handleGetWildcardCertificate(rw http.ResponseWriter, req *http.Request) {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	certPrivKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		_, _ = rw.Write([]byte(err.Error()))
+		h.httpError(rw, err)
 		return
 	}
 
-	template := x509.Certificate{
+	cert := x509.Certificate{
 		SerialNumber: bigintPtr(1),
 		Subject: pkix.Name{
-			Organization: []string{"Acme Co"},
+			Organization: []string{"TraefikLabs"},
 		},
 		DNSNames: []string{
 			"*.localhost",
@@ -122,30 +178,27 @@ func (h *hubHandler) handleGetWildcardCertificate(rw http.ResponseWriter, req *h
 		BasicConstraintsValid: true,
 	}
 
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, priv.Public(), priv)
+	certBytes, err := x509.CreateCertificate(rand.Reader, &cert, h.caCert, certPrivKey.Public(), h.caPrivKey)
 	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		_, _ = rw.Write([]byte(err.Error()))
+		h.httpError(rw, err)
 		return
 	}
 
-	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	privBytes, err := x509.MarshalPKCS8PrivateKey(certPrivKey)
 	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		_, _ = rw.Write([]byte(err.Error()))
+		h.httpError(rw, err)
 		return
 	}
 
-	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
-	key := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certBytes})
+	certPrivKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
 
 	err = json.NewEncoder(rw).Encode(edgeingress.Certificate{
-		Certificate: cert,
-		PrivateKey:  key,
+		Certificate: certPEM,
+		PrivateKey:  certPrivKeyPEM,
 	})
 	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		_, _ = rw.Write([]byte(err.Error()))
+		h.httpError(rw, err)
 		return
 	}
 }
@@ -154,8 +207,7 @@ func (h *hubHandler) handleFetchTopology(rw http.ResponseWriter, req *http.Reque
 	var c state.Cluster
 	err := json.Unmarshal(h.topology, &c)
 	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		_, _ = rw.Write([]byte(err.Error()))
+		h.httpError(rw, err)
 		return
 	}
 
@@ -171,22 +223,19 @@ func (h *hubHandler) handleFetchTopology(rw http.ResponseWriter, req *http.Reque
 func (h *hubHandler) handlePatchTopology(rw http.ResponseWriter, req *http.Request) {
 	body, err := gzip.NewReader(req.Body)
 	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		_, _ = rw.Write([]byte(err.Error()))
+		h.httpError(rw, err)
 		return
 	}
 
 	patch, err := io.ReadAll(body)
 	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		_, _ = rw.Write([]byte(err.Error()))
+		h.httpError(rw, err)
 		return
 	}
 
 	newTopology, err := jsonpatch.MergePatch(h.topology, patch)
 	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		_, _ = rw.Write([]byte(err.Error()))
+		h.httpError(rw, err)
 		return
 	}
 
@@ -206,8 +255,7 @@ func (h *hubHandler) handleCreateResource(rw http.ResponseWriter, req *http.Requ
 		var e edgeingress.EdgeIngress
 		err := json.NewDecoder(req.Body).Decode(&e)
 		if err != nil {
-			rw.WriteHeader(http.StatusInternalServerError)
-			_, _ = rw.Write([]byte(err.Error()))
+			h.httpError(rw, err)
 			return
 		}
 
@@ -246,8 +294,7 @@ func (h *hubHandler) handleDeleteResource(rw http.ResponseWriter, req *http.Requ
 func (h *hubHandler) handleGetPreviousData(rw http.ResponseWriter, req *http.Request) {
 	schema, err := avro.Parse(protocol.MetricsV2Schema)
 	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		_, _ = rw.Write([]byte(err.Error()))
+		h.httpError(rw, err)
 		return
 	}
 
@@ -258,10 +305,13 @@ func (h *hubHandler) handleGetPreviousData(rw http.ResponseWriter, req *http.Req
 
 	err = avro.NewEncoderForSchema(schema, rw).Encode(data)
 	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		_, _ = rw.Write([]byte(err.Error()))
+		h.httpError(rw, err)
 		return
 	}
+}
+
+func (h *hubHandler) handleSendMetrics(rw http.ResponseWriter, req *http.Request) {
+	rw.WriteHeader(http.StatusOK)
 }
 
 func (h *hubHandler) handleGetRules(rw http.ResponseWriter, req *http.Request) {
@@ -273,22 +323,122 @@ func (h *hubHandler) handlePreflightAlerts(rw http.ResponseWriter, req *http.Req
 }
 
 func (h *hubHandler) handleListClusterTunnelEndpoints(rw http.ResponseWriter, req *http.Request) {
-	_ = json.NewEncoder(rw).Encode([]tunnel.Endpoint{})
+	brokerURL := fmt.Sprintf("ws://%s", h.brokerListener.Addr().String())
+	_ = json.NewEncoder(rw).Encode([]tunnel.Endpoint{
+		{
+			TunnelID:       "fake-tunnel-id",
+			BrokerEndpoint: brokerURL,
+		},
+	})
 }
 
-func (h *hubHandler) handleTestIngress(rw http.ResponseWriter, req *http.Request) {
-	_, _ = rw.Write([]byte(`It works !`))
+func (h *hubHandler) handleCreateBrokerTunnel(rw http.ResponseWriter, req *http.Request) {
+	var upgrader websocket.Upgrader
+	websocketConn, err := upgrader.Upgrade(rw, req, nil)
+	if err != nil {
+		h.httpError(rw, err)
+		return
+	}
+
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:0", getLocalIP()))
+	if err != nil {
+		h.httpError(rw, err)
+		return
+	}
+
+	addrParts := strings.Split(listener.Addr().String(), ":")
+	h.tunnelAddr = fmt.Sprintf("%s:%s", getLocalIP(), addrParts[len(addrParts)-1])
+
+	outboundConn := &websocketNetConn{Conn: websocketConn}
+
+	session, err := yamux.Server(outboundConn, &yamux.Config{
+		EnableKeepAlive:        true,
+		LogOutput:              io.Discard,
+		AcceptBacklog:          tunnelAcceptBacklog,
+		MaxStreamWindowSize:    minStreamWindowSize,
+		KeepAliveInterval:      30 * time.Second, // from yamux.DefaultConfig
+		ConnectionWriteTimeout: 10 * time.Second, // from yamux.DefaultConfig
+		StreamCloseTimeout:     5 * time.Minute,  // from yamux.DefaultConfig
+		StreamOpenTimeout:      75 * time.Second, // from yamux.DefaultConfig
+	})
+	if err != nil {
+		h.httpError(rw, err)
+		return
+	}
+
+	defer func() {
+		if sErr := session.Close(); sErr != nil {
+			h.t.Error(sErr)
+		}
+	}()
+
+	listener = &closeAwareListener{Listener: listener}
+
+	listenerClosedCh := make(chan struct{}, 1)
+	go func() {
+		for {
+			inboundConn, aErr := listener.Accept()
+			if aErr != nil {
+				var netErr net.Error
+				if errors.As(aErr, &netErr) && netErr.Temporary() {
+					h.t.Log(aErr)
+					continue
+				}
+
+				if !errors.Is(aErr, errListenerClosed) {
+					h.t.Error(aErr)
+				}
+
+				break
+			}
+
+			go func() {
+				stream, sErr := session.Open()
+				if sErr != nil {
+					h.t.Error(sErr)
+					return
+				}
+
+				errCh := make(chan error)
+				go connCopy(errCh, stream, inboundConn)
+				go connCopy(errCh, inboundConn, stream)
+
+				if chErr := <-errCh; err != nil {
+					h.t.Error(chErr)
+					return
+				}
+				<-errCh
+			}()
+
+			h.t.Log("Not accepting new connection")
+		}
+
+		close(listenerClosedCh)
+	}()
+
+	for {
+		select {
+		case <-session.CloseChan():
+			h.t.Log("Websocket session closed")
+			return
+		case <-listenerClosedCh:
+			h.t.Log("Listener closed")
+			return
+		}
+	}
 }
 
-func getHubRouter() chi.Router {
+func getHubRouter(t *testing.T, listener net.Listener) (chi.Router, *hubHandler) {
+	t.Helper()
+
 	router := chi.NewRouter()
 
 	if testing.Verbose() {
 		router.Use(middleware.Logger)
 	}
 
-	hub := hubHandler{clusterID: "1", workspaceID: "1", topology: []byte("{}")}
+	hub := hubHandler{t: t, brokerListener: listener, clusterID: "1", workspaceID: "1", topology: []byte("{}")}
 	router.Mount("/", hub.Routes())
 
-	return router
+	return router, &hub
 }
